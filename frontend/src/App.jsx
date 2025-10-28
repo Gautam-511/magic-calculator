@@ -1,5 +1,9 @@
 import React, { useRef, useEffect, useState } from 'react';
-import axios from 'axios'; 
+import axios from 'axios';
+// NEW: Import MediaPipe
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+// --- Icon Components ---
 
 const BrushIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9.06 11.9 2 22l10.1-7.06a7.34 7.34 0 0 1 7.07-7.07l-2.12-2.12a2.12 2.12 0 0 0-3-3L2 11.9zM9.06 11.9 2 4.84 4.84 2Z"/></svg>
@@ -13,6 +17,13 @@ const ResetIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 2v6h6"/><path d="M21 12A9 9 0 0 0 6 5.3L3 8"/><path d="M21 22v-6h-6"/><path d="M3 12a9 9 0 0 0 15 6.7l3-2.7"/></svg>
 );
 
+// NEW: Hand Icon
+const HandIcon = () => (
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h2.3a2 2 0 0 0 1.7-1Z"/></svg>
+);
+
+
+// --- Constants ---
 
 const BrushSize = {
   SMALL: 2,
@@ -34,7 +45,7 @@ const TOOL_MODES = {
   BRUSH: 'BRUSH',
   ERASER: 'ERASER'
 };
-
+const SMOOTHING_BUFFER_SIZE = 15; // Average the last 5 points
 function App() {
   const canvasRef = useRef(null);
   const contextRef = useRef(null);
@@ -47,12 +58,19 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 
+  // NEW: Refs and state for Air Drawing
+  const videoRef = useRef(null);
+  const handLandmarkerRef = useRef(null);
+  const [isAirDrawing, setIsAirDrawing] = useState(false);
+  const lastPinchStateRef = useRef(false);
+  // ... with your other refs
+  const drawHistoryRef = useRef([]);
+
   // --- Canvas Setup ---
   useEffect(() => {
     const canvas = canvasRef.current;
     const context = canvas.getContext('2d');
     
-    // Set canvas size based on container, considering device pixel ratio
     const resizeCanvas = () => {
         const { width, height } = canvas.getBoundingClientRect();
         const scale = window.devicePixelRatio;
@@ -106,7 +124,6 @@ function App() {
     const context = contextRef.current;
     if (context) {
         const { width, height } = context.canvas;
-        // The scale is already applied, so we draw on the scaled coordinate system
         const canvasWidth = width / window.devicePixelRatio;
         const canvasHeight = height / window.devicePixelRatio;
         context.fillStyle = '#000000';
@@ -118,8 +135,9 @@ function App() {
     }
   };
 
-  // --- Drawing Event Handlers ---
+  // --- Mouse/Touch Drawing Event Handlers ---
   const startDrawing = (event) => {
+    if (isAirDrawing) return; // Don't allow mouse drawing if air drawing is on
     const { offsetX, offsetY } = getCoords(event);
     contextRef.current.beginPath();
     contextRef.current.moveTo(offsetX, offsetY);
@@ -127,13 +145,13 @@ function App() {
   };
 
   const finishDrawing = () => {
-    if (!isDrawing) return;
+    if (isAirDrawing || !isDrawing) return;
     contextRef.current.closePath();
     setIsDrawing(false);
   };
 
   const draw = (event) => {
-    if (!isDrawing) return;
+    if (!isDrawing || isAirDrawing) return;
     const { offsetX, offsetY } = getCoords(event);
     contextRef.current.lineTo(offsetX, offsetY);
     contextRef.current.stroke();
@@ -164,17 +182,188 @@ function App() {
     }
   };
 
+
+  // --- NEW: MediaPipe Hand Tracking Setup ---
+  useEffect(() => {
+    let animationFrameId;
+
+    const setupHandTracking = async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        handLandmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numHands: 1,
+        });
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 },
+        });
+        
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.addEventListener('loadeddata', startDetectionLoop);
+        }
+
+      } catch (err) {
+        console.error("Error setting up MediaPipe:", err);
+        setError("Could not start webcam or hand tracking.");
+      }
+    };
+
+    const startDetectionLoop = () => {
+      if (handLandmarkerRef.current && videoRef.current && videoRef.current.readyState >= 3) {
+        const results = handLandmarkerRef.current.detectForVideo(videoRef.current, performance.now());
+        processHandData(results);
+        animationFrameId = requestAnimationFrame(startDetectionLoop);
+      } else if (handLandmarkerRef.current) {
+        // If video isn't ready, try again
+        animationFrameId = requestAnimationFrame(startDetectionLoop);
+      }
+    };
+
+    if (isAirDrawing) {
+      setupHandTracking();
+    } else {
+      // Cleanup
+      if (videoRef.current && videoRef.current.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+      if (handLandmarkerRef.current) {
+        handLandmarkerRef.current = null;
+      }
+    }
+
+    return () => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+      }
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+    };
+  }, [isAirDrawing]);
+
+
+  // --- NEW: Air Drawing Logic ---
+const processHandData = (results) => {
+    // --- 1. Get Landmarks and Gesture ---
+    if (!results.landmarks || results.landmarks.length === 0) {
+      if (lastPinchStateRef.current) {
+        // Finish drawing
+        contextRef.current.closePath();
+        lastPinchStateRef.current = false;
+        setIsDrawing(false);
+      }
+      // Clear history when no hand is detected
+      drawHistoryRef.current = [];
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const landmarks = results.landmarks[0];
+    const indexTip = landmarks[8];
+    const thumbTip = landmarks[4];
+
+    const dx = indexTip.x - thumbTip.x;
+    const dy = indexTip.y - thumbTip.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    const pinchThreshold = 0.05;
+    const isPinching = distance < pinchThreshold;
+
+    // --- 2. Calculate Smoothed Point ---
+    const canvasRect = canvas.getBoundingClientRect();
+    const rawX = (1.0 - indexTip.x) * canvasRect.width;
+    const rawY = indexTip.y * canvasRect.height;
+    
+    let smoothedX = rawX;
+    let smoothedY = rawY;
+
+    if (isPinching) {
+      // Add the new point to our history
+      drawHistoryRef.current.push({ x: rawX, y: rawY });
+
+      // If the history is too long, remove the oldest point
+      if (drawHistoryRef.current.length > SMOOTHING_BUFFER_SIZE) {
+        drawHistoryRef.current.shift(); // remove first element
+      }
+      
+      // Calculate the average of all points in the history
+      let totalX = 0;
+      let totalY = 0;
+      for (const point of drawHistoryRef.current) {
+        totalX += point.x;
+        totalY += point.y;
+      }
+      smoothedX = totalX / drawHistoryRef.current.length;
+      smoothedY = totalY / drawHistoryRef.current.length;
+    }
+
+    // --- 3. Draw on Canvas ---
+    const context = contextRef.current;
+
+    if (isPinching) {
+      if (!lastPinchStateRef.current) {
+        // START drawing
+        // We just started pinching, so the history is new.
+        // Move to the *first* available smoothed point.
+        context.beginPath();
+        context.moveTo(smoothedX, smoothedY);
+        lastPinchStateRef.current = true;
+        setIsDrawing(true);
+      } else {
+        // CONTINUE drawing
+        // Use the new smoothed average point
+        context.lineTo(smoothedX, smoothedY);
+        context.stroke();
+      }
+    } else {
+      if (lastPinchStateRef.current) {
+        // FINISH drawing
+        context.closePath();
+        lastPinchStateRef.current = false;
+        setIsDrawing(false);
+      }
+      // IMPORTANT: Clear the history so the line doesn't jump
+      // when you start pinching again in a new location.
+      drawHistoryRef.current = [];
+    }
+  };
+
+
   // --- Render ---
   return (
     <div className="w-screen h-screen bg-gray-900 text-white flex flex-col md:flex-row font-sans overflow-hidden">
       {/* Toolbar */}
-      <aside className="w-full md:w-20 bg-gray-800 p-2 md:p-4 flex flex-row md:flex-col items-center justify-around md:justify-start gap-4 shadow-2xl z-10">
+      <aside className="w-full md:w-20 bg-gray-800 p-2 md:p-4 flex flex-row md:flex-col items-center justify-around md:justify-start gap-4 shadow-2xl z-30"> {/* Set z-20 */}
         <h1 className="hidden md:block text-lg font-bold text-cyan-400 mb-4">Tools</h1>
         
         {/* Tools */}
         <div className="flex md:flex-col gap-3">
             <button onClick={() => setTool(TOOL_MODES.BRUSH)} className={`p-3 rounded-lg transition-colors ${tool === TOOL_MODES.BRUSH ? 'bg-cyan-500' : 'bg-gray-700 hover:bg-gray-600'}`} title="Brush"><BrushIcon /></button>
             <button onClick={() => setTool(TOOL_MODES.ERASER)} className={`p-3 rounded-lg transition-colors ${tool === TOOL_MODES.ERASER ? 'bg-cyan-500' : 'bg-gray-700 hover:bg-gray-600'}`} title="Eraser"><EraserIcon /></button>
+            
+            {/* --- NEW AIR-DRAW TOGGLE --- */}
+            <button 
+              onClick={() => setIsAirDrawing(prev => !prev)} 
+              className={`p-3 rounded-lg transition-colors ${isAirDrawing ? 'bg-green-500' : 'bg-gray-700 hover:bg-gray-600'}`} 
+              title="Air Drawing"
+            >
+              <HandIcon />
+            </button>
         </div>
 
         <div className="w-px md:w-full h-full md:h-px bg-gray-600 my-4"></div>
@@ -193,13 +382,23 @@ function App() {
         
         {/* Actions */}
         <div className="flex md:flex-col gap-3">
-            <button onClick={() => clearCanvas()} className="p-3 bg-red-600 hover:bg-red-700 rounded-lg" title="Reset Canvas"><ResetIcon /></button>
+            <button onClick={() => clearCanvas(false)} className="p-3 bg-red-600 hover:bg-red-700 rounded-lg" title="Reset Canvas"><ResetIcon /></button>
         </div>
 
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col p-4 md:p-6 gap-4 items-center justify-center">
+      <main className="flex-1 flex flex-col p-4 md:p-6 gap-4 items-center justify-center relative"> {/* Added 'relative' */}
+        
+        {/* --- NEW VIDEO ELEMENT --- */}
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          className={`absolute top-0 left-0 w-full h-full object-cover rounded-lg transition-opacity duration-300 ${isAirDrawing ? 'opacity-50 z-20' : 'opacity-0 pointer-events-none'}`}
+          style={{ transform: 'scaleX(-1)' }} // Mirror the video
+        />
+        
         <canvas
           ref={canvasRef}
           onMouseDown={startDrawing}
@@ -209,11 +408,11 @@ function App() {
           onTouchStart={startDrawing}
           onTouchEnd={finishDrawing}
           onTouchMove={draw}
-          className="bg-black rounded-lg shadow-2xl cursor-crosshair w-full h-3/4"
+          className={`relative rounded-lg shadow-2xl cursor-crosshair w-full h-3/4 ${isAirDrawing ? 'bg-black z-10' : 'bg-black'}`}// Made canvas transparent when air-drawing
         />
 
         {/* Solution & Controls */}
-        <div className="w-full flex flex-col md:flex-row gap-4 items-center">
+        <div className="w-full flex flex-col md:flex-row gap-4 items-center z-10"> {/* Added 'z-10' */}
             {/* Solution Area */}
             <div className="w-full md:flex-1 p-4 bg-gray-800 rounded-lg shadow-lg min-h-[80px] flex items-center justify-center">
                 {isLoading && <p className="text-lg text-cyan-400 animate-pulse">Analyzing your drawing...</p>}
@@ -245,4 +444,3 @@ function App() {
 }
 
 export default App;
-
