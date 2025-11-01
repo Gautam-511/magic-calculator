@@ -64,7 +64,8 @@ app.post('/solve', async (req, res) => {
 });
 
 // --- Server Start ---
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-});
+// app.listen(PORT, () => {
+//   console.log(`Server is running on http://localhost:${PORT}`);
+// });
 
+module.exports = app;
